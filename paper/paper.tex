@@ -1,0 +1,712 @@
+\documentclass[11pt]{article}
+\usepackage{fullpage,amsthm,amsfonts,amssymb,epsfig,amsmath,times,amsthm,proof,url}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{claim}[theorem]{Claim}
+
+\begin{document}
+
+\noindent{CMPS 253, Final Project} \\*
+\noindent{Sara Sholes, ssholes} \\*
+\noindent{12 Oct, 2017}\\*
+
+\section*{Introduction:}
+
+In this project, I implemented a type-checker an evaluator for a subset of Haskell. Since Haskell is a functional language 
+and heavily based on lambda calculus, it provided an opportunity to implement several of the concepts discussed 
+in class, such as lambda functions and application, let statements, and case statements.  Additionally, since Haskell does not require 
+explicit typing, it meant that I had a chance to also implement the Hindley-Milner type inference algorithm.\\*
+
+The typechecker and evaluator can process standalone Haskell expressions in an input file specified by the user using the \verb|evalFile| function.  The typechecker and evaluator can handle the Int, Bool, and String base types, lists, the binary operators $+$, $-$, $*$, $\&\&$, $||$, $++$, the comparison operators $<$, $>$, $==$, if statements, lambda functions, function application, let statements (both function let binding and regular variable let binding, and with some support for let polymorpism and resursive expressions), and case statements with patterns composed of lists/cons, literals, variables, and wildcards.\\*  
+
+For each standalone statement, the original statement is printed, and then the type is evaluated and printed out, or an error is printed if the expression is not well-typed. If the statement is well-typed, then the value is also evaluated and printed out.\\*
+
+\section*{Overall Workflow \& Notation}
+
+In order to avoid implementing lexing and parsing by hand, I used \verb|parseFileContents| function from 
+the module Language.Haskell.Exts.Simple to traslate Haskell code into a lexed and parsed AST. The program is written to process $Exp$ type statements, which is an abstract syntax tree representing an expression. The syntax of these statements can is described by Bertram (2016). Throughout this paper, 'expression' and 'term' are used interchangably to indicate an \verb|Exp| statement representing abstract syntax tree representing an expression.\\*
+
+After parsing via \verb|parseFileContents|, an individual expression is preprocessed using the \verb|desugar| function, which does three things.  It converts let function statements to a let variable statement with a lambda function on the right hand side. It also replaces all multi-input lambda functions with a series of nested single-input, single-output lambda functions.  Finally, for each let binding it substitutes the variable with the expression on the right hand side of the binding in the body of the let statement. In other types of expressions, the function is just recursively called on any subexpressions. The result of preprocessing will also be an expression of $Exp$ type. Rules that describe procrocessing are prefixed with a 'P', and are expressed in terms of small step semantics (since that more closely describes the specific steps that occur).\\* 
+
+The preprocessed expression, along with an empty context, is then passed to the \verb|typeEval| function for type evaluation, and will return the type (which may be a type variable, a concrete type, or a compound type expression) and a global context containing the type constraints required by the expression and it's subexpressions. Rules that describe type evaluation are prefixed with a 'T'.\\*
+
+The Hindley-Milner algorithm is then applied via the \verb|unify| function to the type constraints to check whether the expression is well typed, and if so, return an assignment of type variables to types.  Any type variables in the original return type of the  
+expression are then replaced with their assigned type (or assigned a parametric type if there is no such assignment) via the \verb|getReturnType| function, and then that type (or an error if the expression is not well-typed) is printed.\\* 
+
+If the term is well-typed, then the preprocessed expression is passed to the \verb|eval| function, which will evaluate the value of the expression, and the value of the expression will then be printed out. There are a few cases, such application of as recursive functions, which may type check but will fail during value evaluation, and the value evaluation error will then be printed out. Rules that describe value evaluation are prefixed with a 'E' and are expressed in terms of large step semantics.\\*
+
+\section*{Context Structure}
+
+The user defined datatypes \verb|GlobalContext| and \verb|OverallContext| represent the context used during type evaluation.\\*
+
+\begin{verbatim} 
+data GlobalContext = 
+    GlobalContext [AllTypes] [(AllTypes, AllTypes)]
+    | ErrorContext String
+     deriving (Show)
+
+data OverallContext = 
+    OverallContext [(Name, AllTypes)] GlobalContext
+     deriving (Show)
+\end{verbatim} 
+
+As the name suggests, the type \verb|GlobalContext| stores the global context which persists for entire program. This includes the list $\mathcal{X}$ of type variables which have already been used (represented by the \verb|[AllTypes]| field in the \verb|GlobalContext| constructor), and the list $\mathcal{C}$ of type equivalence restraints (represented by the \verb|[(AllTypes, AllTypes)]| field). Since this information is global and evaluation of any subexpression can add new used type variables or new constraints, it is passed as both an input and an output in the \verb|getType| function which is used to type evaluation. This also means that when several sub-expressions are evaluated within an overall expression, the \verb|GlobalContext| output by the type evaluation of the first sub-expression is passed as the input \verb|GlobalContext| to the type-evaluation of the next sub-expression, and so on (this will not be explicitly stated when describing type evaluation of particular expression types). \\* 
+
+Additionally, it means that the \verb|GlobalContext| output by the type evaluation of an overall expression is the \verb|GlobalContext| returned by it's subexpression (or the \verb|GlobalContext| returned by it's last subexpression, if there are multiple), as well as any additional used type variables and constraints added by the expression itself. Simply put, new type variables and new can be added to by the type evaluation of any expression and sub-expression, and these additions to the global context will persist through all remaining type evaluation. For all constraint typing rules, the set of used type variables introduced by any set of subexpressions are assumed to be distinct. Because of this, the store of used type variables $\mathcal{X}$ is omitted from typing constraint rules, apart from an specifying if a fresh type variable is used by an expression.\\*
+
+Most type errors should only occur during the unification step, but in the case that the \verb|getType| function is passed the abstract syntax tree of an expression that is not recognized, or the expression uses a variable which cannot be found in the variable store $\Gamma$, the \verb|ErrorContext| constructor is used (the \verb|String| field stores an appropriate error message) to create a global error context. If an error context is encountered at any stage of type evalution, that error is automatically returned as the result (meaning an expression will return an error is it any contains any sub-expressions which return an error).\\*   
+
+The datatype \verb|OverallContext| contains the \verb|GlobalContext|, and in addition also includes the type variable store $\Gamma$ ( represented in the constructor by \verb|[(Name, AllTypes)]|). Unlike the \verb|GlobalContext|, the variable type store varies based on scope. The outer context which calls a sub-expression determines the global scope, but (with the exception of patterns discussed in section Case Statements and Appendix 1) type evaluation of the sub-expression does not affect the variable store of the enclosing expression. Thus, in order to ensure that the \verb|getType| function has no unintended side effects on the variable store, \verb|getType| takes \verb|OverallContext| as an input (along with the expression being evaluated) and returns \verb|GlobalContext| (along with the type of the evaluated expression). \\*
+     
+\section*{Type Structure}
+
+The user-defined datatypes \verb|AllTypes| and \verb|BaseTypes| were created to respresent the different types that expressions can evaluate to, and \verb|AllTypes| is the return type of the function \verb|typeEval|.\\*
+
+\begin{verbatim} 
+data BaseTypes = IntType
+    | BoolType
+    | StringType
+     deriving (Eq)
+      
+data AllTypes = Base BaseTypes
+    | Error
+    | TypeVar Int
+    | ParamType Int
+    | ArrowType AllTypes AllTypes
+    | ListType AllTypes
+      deriving (Eq)
+\end{verbatim} 
+
+For this project, three base types were defined to be Int, Bool, and String.  To simiplify the code for unification, concrete types were grouped together via the \verb|Base| constructor class, meaning that in order to check whether a type is a base type, you only need to check whether the \verb|Base| constructor is used or not, rather that checking whether it is an Int, a Bool, or a String.\\*
+
+Since errors during type evaluation are indicated with the \verb|ErrorContext| constructor, the AllType \verb|Error| constructor is unneccesary, but is used to stand in for values whose type is unknown because of an error (such as the type of a variable expression for an unbound variable).\\*
+
+The \verb|TypeVar| constructor, which represents variable types, takes an Int value in order to distinguish unique type variables.  A list of previously used type variables is stored in the global context, and when a new type variable is generated, it is assigned the next unused integer value.  Similarly, the \verb|ParamType| constructor, which represents parametric types, also takes an Int value to distinguish unique parameter types.  Parameter types are not used during type evaluation or type unification, they are just used in the final output result type, to distinguish from type variables that just haven't happened to be assigned yet. \\*
+
+The \verb|ArrowType| constructor represents a single input, single output function type, where the first \verb|AllType| specifies the type of the input parameter and the second \verb|AllType| specifies the type of the output.  The \verb|ListType| constructor respresents a list type, and the \verb|AllType| specifies the type of the elements of the list.\\*   
+
+\section*{Value Structure}
+
+The user defined datatype \verb|Value| is the type returned by the value evaluation performed by he \verb|eval| function.\\*
+
+\begin{verbatim} 
+data Value = IntVal Integer
+    | StringVal String
+    | BoolVal Bool
+    | ListVal [Value]
+    | LambdaVal String Exp
+    | ErrValue String
+\end{verbatim} 
+
+For the \verb|IntVal|, \verb|StringVal|, and \verb|BoolVal| constructors, the second field stores the actual raw value of the result. The constructor \verb|ListVal| is recursive; if it represents an empty List, the second field will be an empty list. Otherwise, it will be a list of two elements, where the first is a Value type representing the head value, and the second element is itself a \verb|ListVal|-type Value. The first field of the \verb|LambdaVal| constructor is the variable name of the input parameter, and the second is the function body expression.\\*
+
+Finally, the \verb|ErrValue| constructor represents that an error occurred during value evaluation, and the second field contains the error message. For all expression types, if an error is encounted in any sub-expression, the overall expression will also return an error with the same error message. Only cases where errors can originally occur during value evaluation will be mentioned. \\*  
+
+\section*{Basic types} 
+
+Literal values just evaluate to the their type (and if the type is a literal but is not Int, String, or Bool, and error is raised).\\*
+
+CT-CONCRETE:
+\ \ \ \infer{\Gamma \vdash rawval : T\ \ |\ \ \emptyset}
+    {(rawval, T) \in \{(intval, Int), (boolval, Bool), (stringval, String)\} }
+\bigskip
+
+while for variable references, the type of the variable is looked up in the store.\\*
+
+CT-VAR:
+\ \ \ \infer{\Gamma \vdash t_{1}\ x : T\ \ |\ \ \emptyset}
+    { x : T \in \Gamma}
+\bigskip
+
+In terms of value evaluation, literal values are assigned the appropriate value datatype with the given value.  The rule for integers is given by\\* 
+
+E-LIT:\ \ \
+\infer
+    {intval\ \Downarrow\ Intval\ intval}
+    {}
+\bigskip
+    
+and the the value evaluation rules are equivalent for Bool and String literal values.\\*
+
+During value evaluation for all structures that can bind variable names (like lambda expressions and let expressions), the variables in the body of these structures are replaced by the terms on the right hand side of the binding before the body of the structure is evaluated to get a value (see the sections for these expressions for more details).  Thus, if a variable is encountered during value evaluation, the variable must not be bound, and thus will return an error.\\* 
+
+
+\section*{Lists } 
+
+While a list may seem like a single simple expression, is actually behaves more like a compound expression of all it's elements, since the type of all elements in the list must match.
+The term $consOp$ is used instead of the actual Haskell syntax ":" to distinguish it from the syntax of the typing relation.\\*
+ 
+CT-CONS:
+\ \ \ \deduce{\infer{\Gamma \vdash t_{1}\ consOp \ t_{2} : T_{2}\ \ |\ \ \mathcal{C}'}
+    {\mathcal{C}' = \mathcal{C}_1 \cup \mathcal{C}_2 \cup \{T_{2} = Listtype\ T_{1}\}}}
+    {\Gamma \vdash t_{1} : T_{1}\ \ |\ \ \mathcal{C}_{1}
+    & \Gamma \vdash t_{2} : T_{2}\ \ |\ \ \mathcal{C}_{2}
+    }
+\bigskip
+    
+This rule specifies that the types of both sub-terms $t_{1}$ and $t_{2}$ are evaluated, and the resulting type is the type of the second term $T_{2}$. Additionally, the constraint $T_{2} = Listtype\ T_{1}$ that the type $T_{2}$ of the second term must be a list type with element type of $T_{1}$, is added to the global context.\\*
+
+Lists themselves (of form $[t_{1}, t_{2}, t_{3}, ...t_{n}]$) are type checked in a similar manner. \\* 
+
+CT-EMPTY-LIST:
+\ \ \ \infer{\Gamma \vdash [\ ] : Listtype\ X_{n}\ \ |\ \ \emptyset}
+    {X_{n} \text{ is fresh}}
+\bigskip
+    
+For empty lists $[\ ]$, a fresh type variable $X_{n}$ is created, and the resulting type is a Listtype of this new type variable.\\*
+    
+CT-NONEMPTY-LIST:
+\ \ \ \deduce{\infer{\Gamma \vdash [t_{1}, ... t_{n}] : T_{2}\ \ |\ \ \mathcal{C}'}
+    {\mathcal{C}' = \mathcal{C}_1 \cup \mathcal{C}_2 \cup \{T_{2} = Listtype\ T_{1}\}}}
+    {\Gamma \vdash t_{1} : T_{1}\ \ |\ \ \mathcal{C}_{1}
+    & \Gamma \vdash [t_{2}, ... t_{n}] : T_{2}\ \ |\ \ \mathcal{C}_{2}
+    }
+\bigskip
+
+For non-empty lists $[t_{1}, ... t_{n}]$, type evaluation is the same as a cons expression of the list's first element $t_{1}$ and the rest of the list $[t_{2}, ... t_{n}]$ (which will be the empty list if the original list was of length 1).  In any following discussion of lists, only the cons rule will be stated, and the behavior of non-empty lists is equivalent to a cons between the head element and the list of the remaining elements.\\* 
+
+In terms of value evaluation, an empty list simply produces an ListVal with an empty list as the value field\\*
+
+E-EMPTY-LIST:\ \ \
+\infer
+    {[\ ] \Downarrow ListVal\ [\ ]}
+    {}
+\bigskip
+
+and for non-empty lists/cons operations, the head term $t_{1}$ is evaluated to get the resulting value $v_{1}$, the tail term $t_{2}$ is evaluated to get the resulting value $v_{2}$, and the result is a ListVal with a two element list as the value field, where $v_{1}$ is the first element and $v_{2}$ is the second element.\\* 
+
+E-LIST-CONS:\ \ \
+\infer
+    {t_{1} consOp t_{2} \Downarrow ListVal\ (v_{1} \ consOp\ [ v_{2} ])}
+    {t_{1} \Downarrow v_{1}
+    & t_{2} \Downarrow v_{2}}
+\bigskip
+
+Note that the resulting ListVal produced is a recursive type.\\*
+
+\section*{Binary Operations}
+
+The type evaluation of other binary operations can be summarized as follows:\\*
+
+CT-ARITH-BIN-OPS:
+\ \ \ \deduce{\deduce{\infer{\Gamma \vdash t_{1}\ op\ t_{2} : Int\ \ |\ \ \mathcal{C}'}
+    {\Gamma \vdash t_{1} : T_{1}\ \ |\ \ \mathcal{C}_1
+    & \Gamma \vdash t_{2} : T_{2}\ \ |\ \ \mathcal{C}_2}} 
+    {op \in \{+, -, * \} }}
+    {\mathcal{C}' = \mathcal{C}_1 \cup \mathcal{C}_2 \cup \{T_{1} = Int, T_{2} = Int\} }
+\bigskip
+
+CT-BOOL-BIN-OPS:
+\ \ \ \deduce{\deduce{\infer{\Gamma \vdash t_{1}\ op\ t_{2} : Bool\ \ |\ \ \mathcal{C}'}
+    {\Gamma \vdash t_{1} : T_{1}\ \ |\ \ \mathcal{C}_1
+    & \Gamma \vdash t_{2} : T_{2}\ \ |\ \ \mathcal{C}_2}} 
+    {op \in \{||, \&\&\} }}
+    {\mathcal{C}' = \mathcal{C}_1 \cup \mathcal{C}_2 \cup \{T_{1} = Bool, T_{2} = Bool\} }
+\bigskip
+
+CT-STRING-BIN-OPS:
+\ \ \ \deduce{\infer{\Gamma \vdash t_{1}\ ++\ t_{2} : String\ \ |\ \ \mathcal{C}'}
+    {\Gamma \vdash t_{1} : T_{1}\ \ |\ \ \mathcal{C}_1
+    & \Gamma \vdash t_{2} : T_{2}\ \ |\ \ \mathcal{C}_2}} 
+    {\mathcal{C}' = \mathcal{C}_1 \cup \mathcal{C}_2 \cup \{T_{1} = String, T_{2} = String\} }
+\bigskip
+
+All three rules are implemented in terms of a single function \verb|ctBoolArithExp| which takes the expected input/output type based on the operator type (Int, Bool, and String, respectively) as function inputs. The types of both of the input terms $t_{1}$ and $t_{2}$ are evaluated, and then constraints that the types $T_{1}$ and $T_{2}$ of both terms is the expected input/output type, are added to the global context.  The resulting output type of the overall expression is the given input/output type.\\*
+
+Another similar rule is binary comparisons, which use the following typing constraint rule.\\* 
+
+CT-BIN-CMP:
+\ \ \ \deduce{\deduce{\infer{\Gamma \vdash t_{1}\ op\ t_{2} : Bool\ \ |\ \ \mathcal{C}'}
+    {\Gamma \vdash t_{1} : T_{1}\ \ |\ \ \mathcal{C}_1
+    & \Gamma \vdash t_{2} : T_{2}\ \ |\ \ \mathcal{C}_2}} 
+    {op \in \{<, >, ==\}}}
+    {\mathcal{C}' = \mathcal{C}_1 \cup \mathcal{C}_2 \cup \{T_{1} = T_{2}\} }
+\bigskip
+
+In this case, the constraint $T_{1} = T_{2}$ that the types of both sub-terms are equal, is added to the global context, 
+and the resuting type is always a Bool.  Otherwise, the mechanics are the same as for the previous three rules.  Note that allowing $T_{1}$ and $T_{2}$ to be any types, so long as they are equal, is only valid because the operators $<$, $>$, and $==$ are defined for all three concrete types used in this project.\\*
+
+Value evaluation is similarly simple
+ 
+E-BIN-ARITH:\ \ \
+\deduce
+    {\infer
+        {t_{1} \ op\ t_{2}\Downarrow v_{3}}
+        {t_{1} \Downarrow IntVal\ intval_{1}
+        & t_{2} \Downarrow IntVal\ intval_{2}
+        & v_{3} = IntVal\ (intval_{1} \ op\ intval_{2})}
+    }
+    {op \in \{+, -, *\} }
+\bigskip
+
+E-BIN-BOOL:\ \ \
+\deduce
+    {\infer
+        {t_{1} \ op\ t_{2}\Downarrow v_{3}}
+        {t_{1} \Downarrow BoolVal\ boolval_{1}
+        & t_{2} \Downarrow BoolVal\ boolval_{2}
+        & v_{3} = BoolVal\ (boolval_{1} \ op\ boolval_{2})}
+    }
+    {op \in \{||, \&\&\} }
+\bigskip
+
+E-BIN-STRCAT:\ \ \
+\infer
+    {t_{1} \ ++\ t_{2}\Downarrow v_{3}}
+    {t_{1} \Downarrow StringVal\ strval_{1}
+     & t_{2} \Downarrow StringVal\ strval_{2}
+     & v_{3} = StringVal\ (strval_{1} \ op\ strval_{2})}
+
+\bigskip
+
+Both terms $t_{1}$ and $t_{2}$ are evaluated, the raw values are extracted from the value datatype constructor, the operation is performed on the two raw values. The resulting raw value is then wrapped with the constructor for the corresponding datatype. For comparison operations, the process is the same, except that the resulting raw value will be a boolean value, and will be wrapped in the BoolVal constructor.\\*
+
+E-CMP-OP:\ \ \
+\deduce
+    {\deduce
+        {\infer
+            {t_{1} \ op\ t_{2}\Downarrow v_{3}}
+            {t_{1} \Downarrow Const\ rawval_{1}
+            & t_{2} \Downarrow Const\ rawval_{2}
+            & v_{3} = BoolVal\ (rawval_{1} \ op\ rawval_{2})}
+        }
+        {op \in \{<, >, ==\} }
+    }
+    {(Const, rawval) \in \{(IntVal, intval), (StringVal, stringint), (BoolVal, boolint)\} }
+\bigskip
+
+\section*{If Statements}
+
+The rule for type evaluation of if statements is\\*
+
+CT-IF: 
+\ \ \ \deduce{\infer{\Gamma \vdash \text{ if } t_{1} \text{ then } t_{2} \text{ else } t_{0}: 
+                    Bool\ \ |\ \ \mathcal{C}'}
+            {\Gamma \vdash t_{1} : T_{1} |\ \ \mathcal{C}_1
+            & \Gamma \vdash t_{2} : T_{2} |\ \ \mathcal{C}_2
+            & \Gamma \vdash t_{3} : T_{3} |\ \ \mathcal{C}_3}}
+            {\mathcal{C}' = \mathcal{C}_1 \cup \mathcal{C}_2 \cup \mathcal{C}_3 \cup \{T_{1} = Bool, T_{2} = T_{3}\}}
+     
+Type evaluation is relatively simple; the types of all three sub-terms are evaluated. Then the constraint $T_{1} = Bool$ that the conditional sub-term $t_{1}$ is a Bool type, and the constraint $T_{2} = T_{2}$ that the then and an else sub-terms evaluate to the same type, are added to the global context.\\*
+
+Value evaluation can be summarized by the rules\\*
+
+E-IF-TRUE:\ \ \
+\infer
+    {\text{if } t_{1} \text{ then } t_{2} \text{ else } t_{3}\Downarrow\ v_{2}}
+    {t_{1} \Downarrow (BoolVal\ True)
+    & t_{2} \Downarrow v_{2}
+    }
+\bigskip
+
+and\\*
+
+E-IF-FALSE:\ \ \
+\infer
+    {\text{if } t_{1} \text{ then } t_{2} \text{ else } t_{3}\Downarrow\ v_{3}}
+    {t_{1} \Downarrow (BoolVal\ False)
+    & t_{2} \Downarrow v_{3}
+    }
+\bigskip
+
+Essentially, the control statement expression is evaluated, and if it is a BoolVal with value True, the result is the result of evaluation of the 'then' case expression. If it is a BoolVal with value False, the result is the result of evaluation of the 'else' case expression. Value evaluation is lazy; if the control statement is True, then the value of the 'else' case never gets evaluated, and vice versa.\\*
+         
+\section*{Lambda Functions}
+
+There are multiple ways of defining a function in Haskell.  The simplest is a anonymous 
+lambda function, which takes the form:
+\begin{verbatim}\x y -> x + y\end{verbatim}
+where the variables to the left of the arrow are the input parameters, and the function body 
+is to the right of the arrow. \\*
+
+The other main way to define a function in Haskell is via a let statement. For example, the previous 
+function could be re-written as a named function with the let statement: 
+\begin{verbatim}let foo x y = x + y\end{verbatim}
+
+To ensure that typechecking for functions was consistent, I treated the second case as syntactic sugar, where an AST 
+representing a let defined function
+was translated to a regular let statement with the function name as the variable name in the let binding, and the equivalent 
+anonymous lambda function as the right hand side of the binding.
+
+The preprocessing rules to do this are (with $fArrow$ standing in the for Haskell syntax \verb|->| to distinguish from the arrows in the evaluation rule syntax)\\*
+
+P-LET-LAMBDA-1:\ \ \ \infer{ \text{ let }\ x\ a_{1}\ a_{2}\ ..\ a_{n}\ =\ t_{1} \text{ in } t_{2} \longrightarrow
+                        \text{ let }\ x\ a_{1}\ a_{2}\ ..\ a_{n}\ =\ t'_{1} \text{ in } t_{2}}
+            { t_{1} \longrightarrow t'_{1}}
+\bigskip
+            
+P-LET-LAMBDA-2:\ \ \ \infer{ \text{ let }\ x\ a_{1}\ a_{2}\ ..\ a_{n}\ =\ t'_{1} \text{ in } t_{2} \longrightarrow
+                        \text{ let } x =\ \backslash a_{1}\ a_{2}\ ..\ a_{n} \ fArrow\  t'_{1} \text{ in } t_{2}}
+            {}
+\bigskip 
+
+Additionally, while the AST returned by Language.Haskell.Exts.Simple treated multiple input lambdas as a single lambda 
+expression with a list of inputs, it was simpler to define type checking rules in terms of only single input, single 
+output lambdas.  Thus, during preprocessing, the \verb|curryLambdas| function converts each multiple-input lambda function to a series of nested single input lambda functions. The preprocessing rule is shown below. \\*
+
+P-CURRY-LAMBDAS:\ \ \ \infer{\ \backslash a_{1}\ a_{2}\ ..\ a_{n} \ fArrow\  t'_{1}  \longrightarrow
+                        \ \backslash a_{1} \ fArrow\ \backslash a_{2} \ fArrow\ .. \ \backslash a_{n}\ fArrow\ t'_{1}}
+            {}
+\bigskip
+
+After proprocessing is complete, all functions are assumed to be single-input, single-output. The type evaluation performed by \verb|getType| on a lambda expression can be described by the following rule.\\*
+
+CT-LAMBDA:
+\ \ \ \infer{\Gamma \vdash\ \backslash x\ funArrow\ t : X_{n} \rightarrow T\ \ |\ \ \mathcal{C}}
+    { X_{n} \text{ is fresh } 
+    & \Gamma, x : X_{n} \vdash t : T\ \ |\ \ \mathcal{C}} 
+\bigskip
+
+First, a new type variable $X_{n}$ is generated and added to the global context's record of used type 
+variables. 
+Then, the assignment $x : X_{n}$ of the input variable to this new type variable is added to the variable 
+store context to evaluate the type $T$ of the lambda's body.  The type of 
+the overall lambda expression will be an arrow type $X_{n} \rightarrow T$ from the input variable's type variable 
+to the type of the lambda expression's body, and is returned as the result.\\*
+
+Since a lambda function is considered a value, the value evaluation for lambdas just translates from an expression to an equivalent Value datatype.\\*
+
+E-LAMBDA:\ \ \
+\infer
+    {\ \backslash x \rightarrow t \Downarrow\ LambdaVal\ x\ t }
+    {}
+\bigskip
+
+\section*{Function Application}
+
+The type evaluation performed by \verb|getType| on an application expression can be described by the following rule.\\*
+
+CT-APP:\ \ \ \deduce{\deduce{\infer{\Gamma \vdash t_{1}\ t_{2} : X_{n}\ \ |\ \ \mathcal{C}}
+            {\Gamma \vdash t_{1} : T_{1}\ \ |\ \ \mathcal{C}_{1} 
+            & \Gamma \vdash t_{2} : T_{2}\ \ |\ \ \mathcal{C}_{2} }}
+            {\mathcal{C}' = \mathcal{C}_{1} \cup \mathcal{C}_{2} \cup \{T_{1} = T_{2} \rightarrow X_{n}\} }}
+            {X_{n} \text{ is fresh }}
+\bigskip
+
+The type of the left and right sub-expressions $t_{1}$ and $t_{2}$ are evaluated. Then a fresh type 
+variable $X_{n}$ is generated to represent the overall type of the application expression, and is added to the global 
+context. Finally, a new context rule  
+$T_{1} = T_{2} \rightarrow X_{n}$ that the type of the left sub-expression must be an arrow type from the right sub-expression's type 
+to the application expression's overall type, is added the global context.\\*
+
+The value of an application expression consists of evaluating the value of left term to get a \verb|LambdaVal| type value.  Then the right term $t_{2}$ is substituted for the input parameter $x$ in the \verb|LambdaVal| into the body $t_{3}$ of the \verb|LambdaVal|. The new version of the lambda body sub-expression is then evaluated to get the value of the overall expression. The formal rule is shown below.\\*
+
+E-APP:\ \ \
+\infer
+    {t_{1}\ t_{2} \Downarrow v_{3}}
+    {t_{1} \Downarrow v_{1}
+    & v_{1} = LambdaVal\ \text{\\} x \rightarrow t_{3}
+    & [x \mapsto t_{2}]t_{3} \Downarrow v_{3}
+    }
+\bigskip
+
+\section*{Let Expression}  
+
+Type and value evaluation of let expressions are implemented to support let polymorphism and type evaluation (but not value evaluation) of recursive let expressions.\\*
+
+In order to support let polymophism, the expression $t_{1}$ on the right hand side of a let binding is substituted for the variable $x$ on the left hand side of the binding in all occurances in the body $t_{2}$ of the let expression. This allows each occurance of the right hand side to evaluate to different types if the expression itself is parametric, as discussed in Chapter 22 of Pierce.\\*             
+ 
+All substitution of $x \mapsto t_{1}$ in all let expressions is 
+performed with the \verb|subExpr| method during preprocessing, which can be described by the preprocessing rules (where 
+the $t'$ indicates that a term has already been preprocessed)\\* 
+ 
+P-PATTLET-SUB1:\ \ \ \infer{ \text{ let } x = t_{1} \text{ in } t_{2} \longrightarrow
+                        \text{ let } x = t'_{1} \text{ in } t'_{2}}
+            { t_{1} \longrightarrow t'_{1}
+            & t_{2} \longrightarrow t'_{2} }
+\bigskip  
+ 
+P-PATTLET-SUB2:\ \ \ \infer{ \text{ let } x = t'_{1} \text{ in } t'_{2} \longrightarrow
+                        \text{ let } x = t'_{1} \text{ in } [x \mapsto t'_{1}]t'_{2}}
+            {}
+\bigskip             
+            
+The rule P-LET-SUB1 ensures that the body of the let expression gets preprocessed before the 
+substitution occurs.  This means that a variable which is bound in multiple nested expressions 
+will be replaced by the expression it is bound to in the innermost revelant scope (ie, the expression
+\verb|let x = 2 in let x = "a" x| will evaluate to \verb|let x = 2 in let x = "a" "a"|, not \verb|let x = 2 in let x = "a" 2|).\\* 
+
+By the time type evaluation occurs and  \verb|getType| is called, all occurances of $x$ in 
+$t_{2}$ have been already replaced with $t'_{1}$ to create the expression $t'_{2}$. Thus, type evaluation for the let expression 
+follows the rule:\\*
+
+CT-LET:\ \ \ \deduce{\deduce{\infer{\Gamma \vdash \text{ let } x = t_{1} \text{ in } t'_{2} : T_{2}\ \ 
+                            | \ \ \mathcal{C}'}
+            {\Gamma, x: X_{n} \vdash t_{1}: T_{1}\ \ |\ \ \mathcal{C}_{1}
+            & \Gamma \vdash t'_{2} : T_{2}\ \ |\ \ \mathcal{C}_{2}}}
+            {\mathcal{C}' = \mathcal{C}_{1} \cup \mathcal{C}_{2} \cup \{X_{n} = T_{1}\} }}
+            {X_{n} \text{ is fresh}}
+\bigskip 
+
+Basically, when \verb|typeEval| evaluates a let expression, the right hand side of the let binding is evaluated 
+so that any new type variables it may generate and type constraints it may add are added to the 
+global context, and then the body of the type of let expression is evaluated and returned as the result.  This is to 
+ensure correct typing even if the variable in the let binding is not used in 
+the body of the let expression.\\*
+
+In addition, the fresh type variable $X_{n}$ is generated to represent the type of the 
+type of the right hand side, and the the assignment $x : X_{n}$ is added to the variable store 
+context when evaluating the right hand side $t_{1}$ of the let binding. Additionally, the constraint $X_{n} = T_{1}$ that this new 
+type variable must be the same type that as the type that the right hand side of the binding evaluates to is added to the global context.  
+This allows for many recursive terms, 
+like recursive function definitions, to type check correctly. However, in the case of polymorphic functions, 
+the added constraint $X_{n} = T_{1}$ ensures that once $x$ is bound to a specific type in the right hand side 
+of the binding, $x$ cannot evaluate to a different type in any other occuannces the right hand side term.
+This means that while the expressions
+\begin{verbatim} 
+let len a = case a of
+                [] -> 0
+                h:t -> 1 + (len t)
+            in len [1, 2, 4, 5]
+\end{verbatim}
+and 
+\begin{verbatim} 
+let len a = case a of
+                [] -> 0
+                h:t -> 1 + (len t)
+            in len [1, 2, 4, 5]
+\end{verbatim}
+will correctly evaluate to type Int, the expression
+\begin{verbatim} 
+let len a = case a of
+                [] -> 0
+                h:t -> 1 + (len t)
+            in (len [1, 2, 3, 4]) + (len ["a", "b", "c"])
+\end{verbatim} 
+will encounter an error in unification, though in the actual Haskell language, this expression should should 
+also type check to type Int.\\*
+
+Since this issue only arises if there is an occurance of the variable $x$ in the right hand side of 
+the binding, this issue does not affect non-recursive polymorphic terms.\\* 
+
+In terms of value evaluation, since the expression has already been preprocessed by the time it is passed to the \verb|eval| function for value evaluation, all let bindings have already been substituted into their corresponding body expressions. Thus, the result will simply be the result of evaluating the let body. \\*
+
+E-LET:\ \ \
+\infer
+    {\text{ let } x = t_{1} \text{ in } t'_{2} \Downarrow\ v_{2}}
+    {t'_{2} \Downarrow v_{2}}
+\bigskip
+
+Though type checking does work for recursive expressions (with the exception of re-used polymorpic expressions previously discussed), in many cases value evaluation will not work for recursive expressions, since substituting the entire body of a recursive let expression would result in an infinite loop of recursive calls in the \verb|subExpr| function. Standalone recursively defined functions will evaluate to their expected value, but recursively defined functions within a application expression will throw an error during value evaluation, since the body of the function is only evaluated once the input parameter is bound. T\\* 
+
+There is possibly a work around for functions that converge, that involves substituting in only the relevent parts of the expressions body until a base case is reached and discussed in Chapter 22 of Pierce, but I did not get a chance to implement this.\\*
+
+\section*{Case Statements}
+
+For this project, case statements with patterns composed of lists, variables, and literal values can be type-checked and evaluated. Evaluation of case statements is described by the statement below ($caseArrow$ is used to to stand in for the Haskell syntax \verb|->| used in to seperate the pattern and body of case statement alternatives)\\*
+
+CT-CASE:\ \ \ 
+\deduce{
+      \deduce{
+            \infer
+            {\Gamma \vdash \text{case } t_{0} \text{ of } p_{i} \ caseArrow \ t_{i}^{i \in 1..n} :
+                T_{n}\ \ |\ \ \mathcal{C}' }
+            {\text{for each } i,\ \Gamma \vdash p_{i} : T_{ip}, \Gamma'_{i}\ \ |\ \ \mathcal{C}_{ia} 
+                & \Gamma'_{i} \vdash t_{i} : T_{i}\ \ |\ \ \mathcal{C}_{ib} }
+            }
+      {\Gamma \vdash t_{0}: T_{0} |\ \ \mathcal{C}_{0}}
+      }
+{\mathcal{C}' = \mathcal{C}_{0} \cup (\bigcup_{i \in 1..n} (\mathcal{C}_{ib} \cup \mathcal{C}_{ia} \cup \{ T_{0} = T_{ip} \} \cup \{ T_{i} = T_{i+1} \text{ if } i < n \} ))}
+            
+\bigskip
+
+First, the type of the control expression is evaluated. Then, for each case alternative, the type of the pattern 
+is evaluated. Pattern type evaluation rules are similar to regular typing rules (see Appendix 1), except that when a variable 
+is encountered in a pattern, instead of looking up variables in the variable store, a fresh type 
+variable is generated, and will be added to the variable store context.  
+The other difference is that, because these bindings need to be 
+included in the variable store context for evaluating the body of the case alternative, pattern type evaluation returns 
+the variable store context in addition to the type of the pattern (denoted by the format $\Gamma \vdash p : T, \Gamma'...$). 
+Pattern binding was implemented this way to allow for recursive pattern matching evaluation, which allows the any 
+of the infinite possible list matching patterns (like \verb|a:b:c:tail|) to be matched.\\* 
+
+After the pattern has been type evaluated, the constraint $T_{ip} = T_{0}$ that the case alternative pattern's type $T_{ip}$ is equivalent to control expression type $T_{0}$ is added to the global context.\\*
+
+Next, given the new variable store context generated by the case alternative's pattern type evaluation, the body of the case alternative is evaluated. Finally, add constraint $T_{i} = T_{i+1} \text{ if } i < n$ that the type of each case alternative's body (except for the last case) is equivalent to that of the next case alternative.\\*
+
+Case evaluation can be described by the rule\\*
+
+E-CASELIST:\ \ \ \infer
+            {\text{case } t_{0} \text{ of } (p_{i} \ caseArrow \ t_{i})^{i \in 1..n} \Downarrow v_{j}}
+            {pAlt(p_{j}, t_{0}, t_{j}) = \text{ Just } t_{jnew}
+            & \text{for all }k \in 1..(j-1),\ pAlt(p_{k}, t_{0}, t_{k}) = \text{ Nothing }
+            & t_{jnew} \Downarrow v_{j}
+            }           
+\bigskip
+
+For each $i$th case alternative (proceeding from the first case alternative in order), the control expression $t_{0}$, the case alternative pattern $p_{0}$, and the case alternative body $t_{i}$ are all passed to the the pAlt rule (which corresponds to the \verb|ePat| method in the code). Depending on the structure of the case alternative pattern $p_{i}$, the structure of $t_{0}$ is checked to see if it matches (see Appendix 2 for formal pattern matching rules).\\*   
+
+For a variable pattern $x$, $t_{0}$ will always match and the variable $x$ in the case alternative's body will be replaced with the term $t_{0}$. A wildcard $\_$ pattern always matches the given expression $t_{0}$. If the pattern is a literal value, then the input term $t_{0}$ will be evaluated and it matches if it evaluates to a literal with the same value as the pattern literal. \\*
+For lists, $p_{j}$ and $t_{0}$ match if both are empty lists. If they are both cons operations (or non-empty lists or some combination of the two), then \verb|ePat| method is recursively called to match the heads and tails of the pattern and control expression, and binding any variables found in the pattern to the corresponding sub-expression in the control expression.\\* 
+
+The 'Maybe' monad is used to indicate whether the a case alternative sucessfully matched the control statement or not. If the pattern of a case alternative and the control expression match, then the 'Just' constructor and the body expression $t_{jnew}$ of the case alternative (with substitution of any variables bound by the pattern) is returned. If they do not match, then 'Nothing' is returned. \\*
+
+If the case alternative match succeeds and a 'Just' $t_{jnew}$ expression is returned, then the expression $t_{jnew}$ is evaluated and it's resulting value is returned as the overall result value. If the case alternative match fails and 'Nothing' is returned, then the next case alterative is evaluated. If the last case alternative is reached and none of the cases match, then an error is returned.\\*  
+
+The reason why value evaluation of both the case alternative's body and (other than for case alternatives with literal value pattern expressions) the control expression is delayed is to be able to use the \verb|subExpr| function which takes expressions as inputs for binding in any recursive calls to the \verb|ePat| method for sub-pattern matching.\\*
+
+\section*{Type Inference}
+
+Since Haskell is not explictly typed, type inference must be performed in order to know the types of all terms, and ensure that a term can type check. After type evaluation performed by the \verb|getType| function, in addition to the overall type (possibly a type variable on compound type containing a type variable) of the term, the global context which contains the set of type constraint added during type evaluation is also returned.\\*
+
+If an error was not thrown during type evaluation, the basic Hindley-Milner unification algorithm, described by Milner (1978), is applied using the \verb|unify| function. The \verb|unify| function takes as input the set of constraints from type evaluation, and will return an assignment of type variables to other types if the expression is well-typed, and will return a unification error otherwise.  To encompass these two possiblilties, the following datatype \verb|UnifyResult| was created.\\*
+
+\begin{verbatim}
+data UnifyResult = 
+    TypeVarAssignment [(AllTypes, AllTypes)]
+    | UnificationErr String
+     deriving (Show)
+\end{verbatim}
+
+
+Given an input list of constraints, the algorithm removes a constraint from the constraint list.
+If both types in this constraint are identical, then the constraint is removed and the algorithm is recursively called on the rest of the constraints. 
+If one type in the given constraint is a type variable, then replace all occurrences of that specific type variable in the rest of the constraints with the other type in the given constraint. Then recursively call the algorithm, and add the assignment of the type variable to the other type to the resulting set of assignments of type variables. 
+To handle unification errors, the method \verb|conTVAssign| is used to add a new type variable assignment to the set of type variable assignments returned by a recursive call. If the recursive call returned a unification error, then the overall result will be a unification error, and otherwise the overall set of all type assignments in returned.  Thus, type unification errors in any recursive calls will be mean that the overall result will also be a unification error.\\*
+
+If both types in the given constraint are compound types, then the constraint is replaced with a constraint equating the corresponding subtypes (ie. the constraint $T_{0} \rightarrow T_{1} = S_{0} \rightarrow S_{1}$ would be replaced with the the two new constraints $T_{0} = S_{0}$ and $T_{1} = S_{1}$ in the recursive call, or likewise $Listtype\ T_{0} = Listtype\ S_{0}$ would be replaced by $T_{0} = S_{0}$), and the algorithm is recursively called on this new set of constraints.  If the constraints does not satisfy any of the previous conditions, then a unification error is returned. \\*
+
+This process continues until all constraints have been removed or a unification error has been returned.\\*
+
+After unification is complete, any type variables that may be left in the return type of the overall expression can be substituted for concrete types (here, concrete types refers to the base types Int, Bool, String, and any compound list or arrow types made up of these basy types). The function \verb|getReturnType| takes the resulting assignment and the overall expression's return type, and substitutes in other types for the type variables in the return type.\\*
+
+When a concrete base type (Int, String, or Bool) is encountered, the \verb|getReturnType| function will return the type as is. For any compound types (a Listtype or Arrow type), \verb|getReturnType| will recursively be called on all of the component types, and the types resulting from the resursive calls are then re-assembled back into the original compound type. When a type variable is ecnountered, \verb|getReturnType| will look up the type variable in the assignment list, and then recursively calls \verb|getReturnType| on it's assigned type, and then return the result of this recursive call. When a type variable is encountered that is not assigned to any other type, then that means the type variable is not constrained to a particular concrete type. Thus, the variable type is a parametric type. Since there can be multiple distinct parametric types in a given expression, the function  \verb|getReturnType| will assign to a parametric type with a number to identify it. The identifying number for a parametric type is assigned to be the identifying number of the variable type it was made from. Note that in this function, it is possible for type variables to be assigned to other type variables, which is acceptable, since the function is resursively called on the other variable type (it just means that both will be assigned the same overall type). \\*
+
+
+\section*{Conclusion}
+Overall, the program can effectively type check and evaluate many standalone expressions of Haskell code in an input file.  The program can be run by compiling main.hs, and then running:
+\begin{verbatim}
+evalFile relative_path/testfile.hs
+\end{verbatim}
+A set of test files testing different types of expressions are inculded in the 'testcases' folder. \\*
+
+The most challenging aspects of the project was implementing type inference and value evaluation of case statements. The overall program structure, such as the user-defined datatypes representing types, context, and values, required several stages of redesign in order to work for all expressions and to most cleanly follow the logical type and evaluation rules. Future work could include extending pattern matching in case statements to more types of patterns, and also to make the implementation of pattern handling in type evaluation and value evaluation more consistent.  The main improvement which could be made would enable value evaluation for recursive types.\\*
+
+\noindent\textbf{Bibliography:}\\*
+
+\noindent [1] Benjamin Pierce. "Types and Programming Languages", MIT Press, 2002.\\*
+
+\noindent [2] Felgenhauer, Bertram. "haskell-src-exts-simple-1.19.0.0: A simplified view on the haskell-src-exts AST." (2016). \url{https://hackage.haskell.org/package/haskell-src-exts-simple-1.19.0.0/docs/Language-Haskell-Exts-Simple-Syntax.html }.\\*
+
+\noindent [3] Diehl, Stephen. "Hindley-Milner Inference" (n.d.). \url{http://dev.stephendiehl.com/fun/006_hindley_milner.html }.\\*
+
+\noindent [4] Milner, Robin. "A Theory of Type Polymorphism in Programming." (1978). Journal of Computer and System Sciences, 17. p348-375. 
+
+\newpage
+\section*{Appendix 1: Type Evaluation Pattern Rules}
+
+CT-PATT-VAR:\ \ \
+\deduce
+    {\infer
+        {\Gamma \vdash x\ :\ X_{n}, \Gamma'\ \ |\ \ \mathcal{C}}
+        {\Gamma' = \Gamma, x: X_{n}}}
+    {X_{n} \text{ is fresh}}
+\bigskip
+
+CT-PATT-LIT:\ \ \
+\infer
+        {\Gamma \vdash rawval\ : T, \Gamma\ \ |\ \ \mathcal{C}}
+        {(T, rawval) \in \{(Int, intval), (String, stringval), (Bool, boolval)\} }
+\bigskip  
+
+CT-PATT-WILDCARD:\ \ \
+\infer
+    {\Gamma \vdash \_\ : X_{n}, \Gamma\ \ |\ \ \mathcal{C}}
+    {X_{n} \text{ is fresh}}
+\bigskip
+                
+CT-PATT-EMPTY-LIST:\ \ \                
+\infer
+    {\Gamma \vdash [\ ]\ : Listtype\ X_{n}, \Gamma\ \ |\ \ \mathcal{C}}
+    {X_{n} \text{ is fresh}}
+\bigskip
+
+CT-PATT-NONEMPTY-LIST:\ \ \ 
+\deduce               
+    {\infer
+        {\Gamma \vdash p_{1}\ consOp\ p_{2}\ : Listtype\ T_{1}, \Gamma_{2}\ \ |\ \ \mathcal{C}'}
+        {\Gamma \vdash p_{1} : T_{1}, \Gamma_{1} \ \ |\ \ \mathcal{C}_{1}
+         & \Gamma_{1} \vdash p_{2} : T_{2}, \Gamma_{2} \ \ |\ \ \mathcal{C}_{2}}}
+    {\mathcal{C}' = \mathcal{C}_{1} \cup \mathcal{C}_{2} \cup \{T_{2} = Listtype\ T_{1}\}  }
+\bigskip                
+
+\newpage          
+\section*{Appendix 2: Value Evaluation Pattern Rules}
+
+E-ALT-VAR: \ \ \ \infer
+            {pAlt(x,\ t_{0},\ t_{j})\ = \text{ Just } t_{jnew}}
+            {t_{jnew} = [x \mapsto t_{0}]t_{j}}
+\bigskip
+
+E-ALT-LIT-1: \ \ \ 
+\deduce
+    {\infer
+        {pAlt(v_{p},\ t_{0},\ t_{j})\ = \text{ Just } t_{j}}
+        {t_{0} \Downarrow Const\ rawval_{j}
+        & rawval_{j} = v_{p}}}
+    {(rawval, Const) \in \{(intval, IntVal), (boolval, BoolVal), (stringval, StringVal)\} }
+\bigskip
+
+E-ALT-LIT-2: \ \ \ 
+\deduce
+    {\infer
+        {pAlt(v_{1},\ t_{0},\ t_{j})\ = \text{ Nothing }}
+        {t_{0} \Downarrow Const\ rawval_{j}
+        & rawval_{j} \neq v_{p}}}
+    {(rawval, Const) \in \{(intval, IntVal), (boolval, BoolVal), (stringval, StringVal)\} }
+\bigskip
+
+E-ALT-WILDCARD: \ \ \ \infer
+            {pAlt(\_,\ t_{0},\ t_{j})\ = \text{ Just } t_{j}}
+            {}
+\bigskip
+ 
+E-ALT-EMPTY-LIST-1: \ \ \ \infer
+            {pAlt([\ ],\ t_{0},\ t_{j})\ = \text{ Just } t_{j}}
+            {t_{0}\ =\ [\ ]}
+\bigskip
+
+E-ALT-EMPTY-LIST-2: \ \ \ \infer
+            {pAlt([\ ],\ t_{0},\ t_{j})\ = \text{ Nothing}}
+            {t_{0} \neq [\ ]}
+\bigskip
+
+E-ALT-NONEMPTY-LIST-1: \ \ \ 
+\deduce
+    {\deduce
+        {\infer
+            {pAlt(p_{h}\ consOp\ p_{t},\ t_{0},\ t_{j}) = \text{ Just } t_{jnew}}
+            {t_{0}\ =\ t_{0h}\ consOp\ t_{0t}}
+        }
+        {pAlt(p_{h},\ t_{0h},\ t_{j})\ = \text{ Just } t_{jtemp}}
+    }
+    {pAlt(p_{t},\ t_{0t},\ t_{jtemp})\ = \text{ Just } t_{jnew}}
+\bigskip
+
+E-ALT-NONEMPTY-LIST-2: \ \ \ 
+\deduce
+    {\infer
+        {pAlt(p_{h}\ consOp\ p_{t},\ t_{0},\ t_{j})\ = \text{ Nothing }}
+        {t_{0}\ =\ t_{0h}\ consOp\ t_{0t}}
+    }
+    {pAlt(p_{h},\ t_{0h},\ t_{j})\ = \text{ Nothing } }
+\bigskip
+
+E-ALT-NONEMPTY-LIST-3: \ \ \ 
+\deduce
+    {\deduce
+        {\infer
+            {pAlt(p_{h}\ consOp\ p_{t}, t_{0}, t_{j}) = \text{ Nothing }}
+            {t_{0} = t_{0h}\ consOp\ t_{0t}}
+        }
+        {pAlt(p_{h},\ t_{0h},\ t_{j})\ = \text{ Just } t_{jtemp}}
+    }
+    {pAlt(p_{t},\ t_{0t},\ t_{jtemp})\ = \text{ Nothing }}
+\bigskip
+
+E-ALT-NONEMPTY-LIST-4: \ \ \ \infer
+            {pAlt(p_{h}\ consOp\ p_{t},\ t_{0},\ t_{j})\ = \text{ Nothing }}
+            {t_{0}\ \neq\ t_{0h}\ consOp\ t_{0t}}
+\bigskip
+
+\end{document}
